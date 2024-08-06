@@ -118,6 +118,9 @@ def parse_option():
     parser.add_argument('--optim', type=str,
                         help='overwrite optimizer if provided, can be adamw/sgd/fused_adam/fused_lamb.')
 
+    parser.add_argument('--token', type=str, 
+                        help='Put your huggingface token here to download dataset.')
+
     args, unparsed = parser.parse_known_args()
 
     config = get_config(args)
@@ -142,24 +145,24 @@ def get_labels(a_dataset):
     return labels, label2id, id2label
 
 
-def get_ds(dataset_name='food101', num_proc=4):
+def get_ds(dataset_name, data_path, num_proc=4):
     dataset = load_dataset(dataset_name,
 #                            split='train[:50000]',
                            num_proc=num_proc,
-                           cache_dir='.././dataset_caches/imagenet-1k',
-                           token='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'
+                           cache_dir=data_path,
+                           token=os.environ['TOKEN']
                            )
     print(dataset)
 #     dataset = dataset.train_test_split(0.2, )
 #     test_name = 'test'
-    test_name = 'validation'
+    train_name, test_name = list(dataset.keys())[:2]
 
-    train_len = len(dataset['train'])
+    train_len = len(dataset[train_name])
     test_len = len(dataset[test_name])
 
     labels, label2id, id2label = get_labels(dataset)
     # split up training into training + validation
-    train_ds = dataset['train']
+    train_ds = dataset[train_name]
     test_ds = dataset[test_name]
     # val_ds = dataset['validation']
 
@@ -263,10 +266,13 @@ def replace_all_linear_layers(module, custom_linear_layer):
             replace_all_linear_layers(child, custom_linear_layer)
 
 
-def get_model(config, device, switch_back=False):
+def get_model(config, device, linear='simple'):
     m = SwinForImageClassification(config)
-    if switch_back:
+    if linear == 'switchback':
         replace_all_linear_layers(m, SwitchBackLinear)
+    elif linear == 'jetfire':
+        # Here we put our jetfire code.
+        ...
     m = m.to(device)
     return m
 
@@ -438,7 +444,8 @@ def main(config):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds, test_ds, labels, label2id, id2label, train_len, test_len = get_ds("imagenet-1k", num_proc=10)
+    train_ds, test_ds, labels, label2id, id2label, train_len, test_len = get_ds("imagenet-1k", config.DATA.DATA_PATH, 
+                                                                                num_proc=config.DATA.NUM_WORKERS)
 
     train_transforms = build_transform(True, config)
     val_transforms = build_transform(False, config)
@@ -449,7 +456,7 @@ def main(config):
     train_dataloader, test_dataloader, mixup = get_loaders(train_ds, test_ds, config)
 
     swin_config = SwinConfig(num_labels=len(labels), label2id=label2id, id2label=id2label)
-    swin_model = get_model(swin_config, device, switch_back=False)
+    swin_model = get_model(swin_config, device, linear='simple')
     model_without_ddp = swin_model
     loss_scaler = NativeScalerWithGradNormCount()
 
