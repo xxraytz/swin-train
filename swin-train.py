@@ -57,7 +57,6 @@ from torch.profiler import record_function, ProfilerActivity, profile
 from timm.scheduler.cosine_lr import CosineLRScheduler
 from timm.utils import accuracy, AverageMeter
 from functools import partial
-from bitsandbytes.nn.triton_based_modules import SwitchBackLinear
 from timm.loss import LabelSmoothingCrossEntropy
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -67,6 +66,13 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from utils import (load_checkpoint,
                    save_checkpoint,
                    NativeScalerWithGradNormCount, auto_resume_helper, reduce_tensor)
+
+# Linear layers
+import sys
+from bitsandbytes.nn.triton_based_modules import SwitchBackLinear
+sys.path.append("/home/dev/Jetfire-INT8Training/JetfireGEMMKernel/BlockQuantize/")
+from EQBlockLinear import EQBlockLinear
+
 
 PYTORCH_MAJOR_VERSION = int(torch.__version__.split('.')[0])
 
@@ -257,7 +263,12 @@ def collate_fn(examples):
 def replace_all_linear_layers(module, custom_linear_layer):
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
-            new_linear = custom_linear_layer(child.in_features, child.out_features, bias=child.bias is not None)
+            if child.in_features % 32 == 0 and child.out_features % 32 == 0 and child.out_features > (32 * 3):
+                logger.info(f'{child}-yes')
+                new_linear = custom_linear_layer(child.in_features, child.out_features, bias=child.bias is not None)
+            else:
+                logger.info(f'{child}-no')
+                new_linear = nn.Linear(child.in_features, child.out_features, bias=child.bias is not None)
             # new_linear.weight.data = child.weight.data.half()
             # if new_linear.bias is not None:
             # new_linear.bias.data = child.bias.data.half()
@@ -267,12 +278,16 @@ def replace_all_linear_layers(module, custom_linear_layer):
 
 
 def get_model(config, device, linear='simple'):
+    config.window_size  = 8
     m = SwinForImageClassification(config)
     if linear == 'switchback':
         replace_all_linear_layers(m, SwitchBackLinear)
     elif linear == 'jetfire':
         # Here we put our jetfire code.
+
+        replace_all_linear_layers(m, EQBlockLinear)
         ...
+    print(m)
     m = m.to(device)
     return m
 
@@ -342,7 +357,8 @@ def train_one_epoch(config, model, criterion, train_data_loader, optimizer, epoc
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
     scaler_meter = AverageMeter()
-
+    
+    torch.cuda.synchronize()
     start = time.time()
     end = time.time()
     # from itertools import islice
@@ -354,7 +370,7 @@ def train_one_epoch(config, model, criterion, train_data_loader, optimizer, epoc
             inputs, labels = mixup_fn(inputs, labels)
             labels = torch.argmax(labels, 1)
 
-        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
             outputs = model(inputs)
 
         loss = criterion(outputs.logits, labels.long())
@@ -456,7 +472,7 @@ def main(config):
     train_dataloader, test_dataloader, mixup = get_loaders(train_ds, test_ds, config)
 
     swin_config = SwinConfig(num_labels=len(labels), label2id=label2id, id2label=id2label)
-    swin_model = get_model(swin_config, device, linear='simple')
+    swin_model = get_model(swin_config, device, linear=os.environ['LINEAR_TYPE'])
     model_without_ddp = swin_model
     loss_scaler = NativeScalerWithGradNormCount()
 
