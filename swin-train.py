@@ -260,12 +260,22 @@ def collate_fn(examples):
     return {"pixel_values": pixel_values, "labels": labels}
 
 
-def replace_all_linear_layers(module, custom_linear_layer):
+def replace_all_linear_layers(module, custom_linear_layer, index=0):
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
-            if child.in_features % 32 == 0 and child.out_features % 32 == 0 and child.out_features > (32 * 3):
-                logger.info(f'{child}-yes')
-                new_linear = custom_linear_layer(child.in_features, child.out_features, bias=child.bias is not None)
+            if (child.in_features % 32 == 0 
+                and child.out_features % 32 == 0 
+                and child.out_features > (32 * 3)
+                and (child.in_features != 192 and child.out_features != 192)
+                ):
+                # print(index)
+                index += 1
+                if index in []:
+                    logger.info(f'{child}-no')
+                    new_linear = nn.Linear(child.in_features, child.out_features, bias=child.bias is not None)
+                else:
+                    logger.info(f'{child}-yes')
+                    new_linear = custom_linear_layer(child.in_features, child.out_features, bias=child.bias is not None)
             else:
                 logger.info(f'{child}-no')
                 new_linear = nn.Linear(child.in_features, child.out_features, bias=child.bias is not None)
@@ -274,12 +284,37 @@ def replace_all_linear_layers(module, custom_linear_layer):
             # new_linear.bias.data = child.bias.data.half()
             setattr(module, name, new_linear)
         else:
-            replace_all_linear_layers(child, custom_linear_layer)
+            index = replace_all_linear_layers(child, custom_linear_layer, index=index)
+    return index
 
+def get_model(config, device, num_labels, label2id, id2label, linear='simple'):
+    # config.window_size  = 8
+    
+    
+    swin_config = SwinConfig(
+        img_size=config.DATA.IMG_SIZE,
+        patch_size=config.MODEL.SWIN.PATCH_SIZE,
+        # in_chans=config.MODEL.SWIN.IN_CHANS,
+        # num_classes=config.MODEL.NUM_CLASSES,
+        embed_dim=config.MODEL.SWIN.EMBED_DIM,
+        depths=config.MODEL.SWIN.DEPTHS,
+        num_heads=config.MODEL.SWIN.NUM_HEADS,
+        window_size=config.MODEL.SWIN.WINDOW_SIZE,
+        # mlp_ratio=config.MODEL.SWIN.MLP_RATIO,
+        # qkv_bias=config.MODEL.SWIN.QKV_BIAS,
+        # qk_scale=config.MODEL.SWIN.QK_SCALE,
+        # drop_rate=config.MODEL.DROP_RATE,
+        # drop_path_rate=config.MODEL.DROP_PATH_RATE,
+        # ape=config.MODEL.SWIN.APE,
+        # norm_layer=layernorm,
+        # patch_norm=config.MODEL.SWIN.PATCH_NORM,
+        # use_checkpoint=config.TRAIN.USE_CHECKPOINT,
+        # fused_window_process=config.FUSED_WINDOW_PROCESS,
+        num_labels=num_labels, label2id=label2id, id2label=id2label
+        )
 
-def get_model(config, device, linear='simple'):
-    config.window_size  = 8
-    m = SwinForImageClassification(config)
+    
+    m = SwinForImageClassification(swin_config)
     if linear == 'switchback':
         replace_all_linear_layers(m, SwitchBackLinear)
     elif linear == 'jetfire':
@@ -471,8 +506,8 @@ def main(config):
 
     train_dataloader, test_dataloader, mixup = get_loaders(train_ds, test_ds, config)
 
-    swin_config = SwinConfig(num_labels=len(labels), label2id=label2id, id2label=id2label)
-    swin_model = get_model(swin_config, device, linear=os.environ['LINEAR_TYPE'])
+    
+    swin_model = get_model(config, device, len(labels), label2id, id2label, linear=os.environ['LINEAR_TYPE'])
     model_without_ddp = swin_model
     loss_scaler = NativeScalerWithGradNormCount()
 
