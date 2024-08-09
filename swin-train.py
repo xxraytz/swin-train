@@ -68,10 +68,20 @@ from utils import (load_checkpoint,
                    NativeScalerWithGradNormCount, auto_resume_helper, reduce_tensor)
 
 # Linear layers
+try:
+    from bitsandbytes.nn.triton_based_modules import SwitchBackLinear
+    from bitsandbytes.optim import AdamW8bit, Adam8bit
+except:
+    print('No bitsandbytes lib are installed. You could fall into troubles with Adam8bit, AdamW8bit, SwitchbackLinear')
+
 import sys
-from bitsandbytes.nn.triton_based_modules import SwitchBackLinear
-sys.path.append("/home/dev/Jetfire-INT8Training/JetfireGEMMKernel/BlockQuantize/")
-from EQBlockLinear import EQBlockLinear
+
+
+sys.path.append("/home/dev/Jetfire-INT8Training/JetfireGEMMKernel/BlocknviQuantize/")
+try:
+    from EQBlockLinear import EQBlockLinear
+except:
+    print('No bitsandbytes lib are installed. You could get stacked with JetFire linear layer')
 
 
 PYTORCH_MAJOR_VERSION = int(torch.__version__.split('.')[0])
@@ -333,8 +343,14 @@ def get_criterion():
 
 def get_optimizer(config, model):
     parameters = set_weight_decay(model, {}, {})
-    optimizer = optim.AdamW(parameters, eps=config.TRAIN.OPTIMIZER.EPS, betas=config.TRAIN.OPTIMIZER.BETAS,
-                            lr=config.TRAIN.BASE_LR, weight_decay=config.TRAIN.WEIGHT_DECAY)
+    if os.environ["OPTIMIZER"] == 'AdamW':
+        optim_f = optim.AdamW
+    elif os.environ["OPTIMIZER"] == 'AdamW8bit':
+        optim_f = AdamW8bit
+        
+    logger.info(f'{optim_f} was choosed.')
+    optimizer = optim_f(parameters, eps=config.TRAIN.OPTIMIZER.EPS, betas=config.TRAIN.OPTIMIZER.BETAS,
+                                lr=config.TRAIN.BASE_LR, weight_decay=config.TRAIN.WEIGHT_DECAY)
     return optimizer
 
 
