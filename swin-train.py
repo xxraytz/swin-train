@@ -7,6 +7,8 @@ from logger import create_logger
 import random
 import datetime
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
 try:
     from torch._six import inf
 except:
@@ -67,9 +69,10 @@ from utils import (load_checkpoint,
                    save_checkpoint,
                    NativeScalerWithGradNormCount, auto_resume_helper, reduce_tensor)
 
+from apex.optimizers import FusedAdam
 # Linear layers
 try:
-    from bitsandbytes.nn.triton_based_modules import SwitchBackLinear
+    from bitsandbytes.nn.triton_based_modules import SwitchBackLinear, SwitchBackLinearVectorwise
     from bitsandbytes.optim import AdamW8bit, Adam8bit
 except:
     print('No bitsandbytes lib are installed. You could fall into troubles with Adam8bit, AdamW8bit, SwitchbackLinear')
@@ -79,12 +82,22 @@ import sys
 
 sys.path.append("/home/dev/Jetfire-INT8Training/JetfireGEMMKernel/BlocknviQuantize/")
 try:
-    from EQBlockLinear import EQBlockLinear
+    from BlockQuantize.EQBlockLinear import EQBlockLinear
 except:
-    print('No bitsandbytes lib are installed. You could get stacked with JetFire linear layer')
+    print('No Jetfire libs are instaled. You could get stacked with JetFire linear layer')
 
 
 PYTORCH_MAJOR_VERSION = int(torch.__version__.split('.')[0])
+CHECK_IT = [
+[128, 256, 768, 384, ],
+[512, 64, 384, 384, ],
+[128, 256, 384, 1536, ],
+[128, 256, 1536, 384, ],
+[128, 64, 1536, 768, ],
+[128, 64, 768, 768, ],
+[128, 64, 768, 3072, ],
+[128, 64, 3072, 768, ],]
+
 
 
 def parse_option():
@@ -163,14 +176,14 @@ def get_labels(a_dataset):
 
 def get_ds(dataset_name, data_path, num_proc=4):
     dataset = load_dataset(dataset_name,
-#                            split='train[:50000]',
+                           split='train[:50000]',
                            num_proc=num_proc,
                            cache_dir=data_path,
                            token=os.environ['TOKEN']
                            )
+    dataset = dataset.train_test_split(0.2, )
+    test_name = [dataset.keys()][-1]
     print(dataset)
-#     dataset = dataset.train_test_split(0.2, )
-#     test_name = 'test'
     train_name, test_name = list(dataset.keys())[:2]
 
     train_len = len(dataset[train_name])
@@ -258,15 +271,17 @@ def get_loaders(train_ds, test_ds, config):
 
 
 def preprocess(example_batch, transform_f):
-    example_batch["pixel_values"] = [
-        transform_f(image.convert("RGB")) for image in example_batch["image"]
-    ]
+    with record_function('preprocessing'):
+        example_batch["pixel_values"] = [
+            transform_f(image.convert("RGB")) for image in example_batch["image"]
+        ]
     return example_batch
 
 
 def collate_fn(examples):
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    labels = torch.tensor([example["label"] for example in examples])
+    with record_function('collate inter'):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        labels = torch.tensor([example["label"] for example in examples])
     return {"pixel_values": pixel_values, "labels": labels}
 
 
@@ -274,11 +289,12 @@ def replace_all_linear_layers(module, custom_linear_layer, index=0):
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
             if (child.in_features % 32 == 0 
-                and child.out_features % 32 == 0 
-                and child.out_features > (32 * 3)
-                and (child.in_features != 192 and child.out_features != 192)
-                ):
-                # print(index)
+                and child.out_features % 32 == 0):
+                # and child.out_features > (32 * 3)
+                # and (child.in_features != 192 and child.out_features != 192)
+                # ):
+            # if [child.in_features, child.out_features] in [[el[-2], el[-1]] for el in CHECK_IT]:
+                    # print(index)
                 index += 1
                 if index in []:
                     logger.info(f'{child}-no')
@@ -327,6 +343,7 @@ def get_model(config, device, num_labels, label2id, id2label, linear='simple'):
     m = SwinForImageClassification(swin_config)
     if linear == 'switchback':
         replace_all_linear_layers(m, SwitchBackLinear)
+        # replace_all_linear_layers(m, SwitchBackLinearVectorwise)
     elif linear == 'jetfire':
         # Here we put our jetfire code.
 
@@ -347,6 +364,8 @@ def get_optimizer(config, model):
         optim_f = optim.AdamW
     elif os.environ["OPTIMIZER"] == 'AdamW8bit':
         optim_f = AdamW8bit
+    elif os.envirom["OPTIMIZER"] == 'FusedAdam':
+        optim_f = FusedAdam
         
     logger.info(f'{optim_f} was choosed.')
     optimizer = optim_f(parameters, eps=config.TRAIN.OPTIMIZER.EPS, betas=config.TRAIN.OPTIMIZER.BETAS,
@@ -409,32 +428,38 @@ def train_one_epoch(config, model, criterion, train_data_loader, optimizer, epoc
     norm_meter = AverageMeter()
     scaler_meter = AverageMeter()
     
-    torch.cuda.synchronize()
+    # torch.cuda.synchronize()
     start = time.time()
     end = time.time()
-    # from itertools import islice
-    for idx, data in enumerate(train_data_loader):
-        inputs = data['pixel_values'].cuda(non_blocking=True)
-        labels = data['labels'].cuda(non_blocking=True)
+    from itertools import islice
+    for idx, data in enumerate(islice(train_data_loader, 5)):
+        with record_function('dataloader'):
+            inputs = data['pixel_values'].cuda()
+            labels = data['labels'].cuda()
 
-        if mixup_fn is not None:
-            inputs, labels = mixup_fn(inputs, labels)
-            labels = torch.argmax(labels, 1)
+        with record_function('mixfn'):
+            if mixup_fn is not None:
+                inputs, labels = mixup_fn(inputs, labels)
+                labels = torch.argmax(labels, 1)
 
-        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-            outputs = model(inputs)
+        with torch.cuda.amp.autocast():
+            with record_function('model(output)'):
+                outputs = model(inputs)
+            
+            loss = criterion(outputs.logits, labels.long())
+            
+            is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+            
+            with record_function('backward'):
+                grad_norm = loss_scaler(loss, optimizer, clip_grad=1,
+                                    parameters=model.parameters(), create_graph=is_second_order,
+                                    update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
 
-        loss = criterion(outputs.logits, labels.long())
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        grad_norm = loss_scaler(loss, optimizer, clip_grad=1,
-                                parameters=model.parameters(), create_graph=is_second_order,
-                                update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
+            optimizer.zero_grad()
+            lr_scheduler.step_update(epoch * num_steps + idx)
+            loss_scale_value = loss_scaler.state_dict()["scale"]
 
-        optimizer.zero_grad()
-        lr_scheduler.step_update(epoch * num_steps + idx)
-        loss_scale_value = loss_scaler.state_dict()["scale"]
-
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         loss_meter.update(loss.item(), labels.size(0))
         if grad_norm is not None:  # loss_scaler return None if not update
             norm_meter.update(grad_norm)
@@ -564,13 +589,19 @@ def main(config):
 
     logger.info("Start training")
     start_time = time.time()
-    for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                     profile_memory=True,
+                     ) as prof:
+        for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
 
-        train_one_epoch(
-            config, swin_model, get_criterion(), train_dataloader,
-            swin_optimizer, epoch, mixup, swin_lr_scheduler,
-            loss_scaler
-        )
+            train_one_epoch(
+                config, swin_model, get_criterion(), train_dataloader,
+                swin_optimizer, epoch, mixup, swin_lr_scheduler,
+                loss_scaler
+            )
+            if epoch > 2:
+                break
+            
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, swin_optimizer, swin_lr_scheduler,
                             loss_scaler,
@@ -583,6 +614,7 @@ def main(config):
         logger.info(f"Accuracy of the network on the {len(test_ds)} test images: {acc1:.1f}%")
         max_accuracy = max(max_accuracy, acc1)
         logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+    prof.export_chrome_trace('profiling.json')
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
