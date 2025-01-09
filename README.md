@@ -1,5 +1,6 @@
 
-First of all install libs following this README: https://github.com/microsoft/Swin-Transformer/blob/main/get_started.md. You should install:
+First of all install libs following this README: https://github.com/microsoft/Swin-Transformer/blob/main/get_started.md. 
+
 Also you should install:
 bitsandbytes
 triton==2.0.0
